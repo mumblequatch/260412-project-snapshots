@@ -71,6 +71,21 @@ Edit the **Project** Select options directly in the Notion database (click the c
 - `snapshot.py` — main app; KM triggers this
 - `config_example.json` — template for `~/.config/project-snapshots/config.json`
 - `requirements.txt` — `notion-client`, `customtkinter`
+- `companions/` — adjacent tools (see below)
+
+## Companion tools
+
+Three small helpers live in `companions/`. They're referenced from Keyboard Maestro macros; install with:
+
+```bash
+cp companions/project_snapshot_km.sh companions/open_path_from_clipboard.sh ~/Scripts/
+chmod +x ~/Scripts/project_snapshot_km.sh ~/Scripts/open_path_from_clipboard.sh
+bash companions/build-openfile-app.sh
+```
+
+- **`project_snapshot_km.sh`** — thin wrapper KM calls to launch the snapshot form. Point your KM macro at `~/Scripts/project_snapshot_km.sh`.
+- **`open_path_from_clipboard.sh`** — simulates Cmd-C, reads the clipboard, reveals that file path in Finder. Bind to a KM hotkey so you can triple-click a path in Notion and reveal it in Finder.
+- **`openfile-handler.applescript`** + `build-openfile-app.sh` — builds `~/Applications/OpenFile.app`, which registers the `openfile://` URL scheme. Dispatches `openfile://<urlencoded-path>` URLs to macOS `open`. Useful from Alfred/Raycast/Terminal. Notion rejects custom schemes in link fields, so this is *not* called from the snapshot form directly.
 
 ## Notes
 
