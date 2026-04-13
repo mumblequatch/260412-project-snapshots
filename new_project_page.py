@@ -1,29 +1,22 @@
 #!/usr/bin/env python3
-"""Populate a Project DB row's page body with a useful layout.
+"""Populate a Project DB row's page body with scaffolding for manual linked views.
 
-LINKED-VIEW MECHANISM — IMPORTANT:
+The Notion public API cannot create `linked_database` blocks (the in-page
+filtered views you get from typing `/linked` in the Notion UI). So this
+script lays down section headings + placeholder hints + database-mention
+links. The user then adds a real linked view under each heading once, in
+the Notion UI, and deletes the placeholder line.
 
-  The Notion public API does NOT support creating `linked_database` blocks
-  (a.k.a. "linked views" — the in-page views that let you re-filter/re-sort
-  an existing DB without cloning it). Only `child_database` is creatable,
-  and child_database creates a BRAND-NEW empty database inline, which is
-  not what we want.
-
-  Given that, this module renders each section as:
-    1. A heading_2 title for the section.
-    2. A rendered snapshot of the filtered query results, written as
-       bulleted_list_item / paragraph blocks at population time.
-    3. A small "Open <DB name> →" paragraph containing a link_to_page
-       mention to the underlying database, so the user can click through
-       to the full DB when they need live filtering.
-
-  Re-running with --force wipes the body and re-renders, so this acts as a
-  "refresh" button. Day-to-day the user can click the Open link to get a
-  live view, or re-run this script to refresh the snapshot in place.
+Layout populated per Project page:
+  1. Notes           — heading + empty paragraph for freeform notes.
+  2. Subprojects     — heading + placeholder + Subprojects DB link.
+  3. Tasks           — heading + placeholder + PTL DB link.
+  4. Recent Snapshots— heading + placeholder + PS DB link.
+  5. Done tasks      — collapsed toggle with placeholder + PTL DB link inside.
 
 Usage:
     python new_project_page.py                 # populate all empty Projects
-    python new_project_page.py --force         # destructive: wipe + repopulate ALL
+    python new_project_page.py --force         # wipe + repopulate ALL (destructive)
 """
 from __future__ import annotations
 
@@ -33,19 +26,11 @@ from pathlib import Path
 
 from notion_client import Client
 
-from notion_client_helpers import (
-    query_all,
-    title_of,
-    relation_ids,
-    select_name,
-    number_of,
-)
+from notion_client_helpers import query_all, title_of
 
 CONFIG_PATH = Path.home() / ".config" / "project-snapshots" / "config.json"
 
-MAX_RECENT_SNAPSHOTS = 10
-MAX_TASKS_DISPLAYED = 50
-MAX_DONE_TASKS_DISPLAYED = 50
+PLACEHOLDER = "↳ Add a linked view here (Notion UI: /linked → pick DB → filter to this Project), then delete this line."
 
 
 # ── Block factories ──────────────────────────────────────────────────────────
@@ -54,29 +39,13 @@ def h2(text: str) -> dict:
     return {
         "object": "block",
         "type": "heading_2",
-        "heading_2": {
-            "rich_text": [{"type": "text", "text": {"content": text}}],
-        },
+        "heading_2": {"rich_text": [{"type": "text", "text": {"content": text}}]},
     }
 
 
 def para(text: str = "") -> dict:
     rt = [{"type": "text", "text": {"content": text}}] if text else []
-    return {
-        "object": "block",
-        "type": "paragraph",
-        "paragraph": {"rich_text": rt},
-    }
-
-
-def bullet(text: str) -> dict:
-    return {
-        "object": "block",
-        "type": "bulleted_list_item",
-        "bulleted_list_item": {
-            "rich_text": [{"type": "text", "text": {"content": text[:2000]}}],
-        },
-    }
+    return {"object": "block", "type": "paragraph", "paragraph": {"rich_text": rt}}
 
 
 def italic_para(text: str) -> dict:
@@ -100,10 +69,7 @@ def db_link_para(label: str, database_id: str) -> dict:
         "paragraph": {
             "rich_text": [
                 {"type": "text", "text": {"content": f"{label} "}},
-                {
-                    "type": "mention",
-                    "mention": {"type": "database", "database": {"id": database_id}},
-                },
+                {"type": "mention", "mention": {"type": "database", "database": {"id": database_id}}},
             ],
         },
     }
@@ -126,173 +92,31 @@ def load_config() -> dict:
     return json.loads(CONFIG_PATH.read_text())
 
 
-# ── Section builders ─────────────────────────────────────────────────────────
+# ── Section builders (scaffolding only) ──────────────────────────────────────
 
 def build_notes_section() -> list[dict]:
     return [h2("Notes"), para("")]
 
 
-def build_subprojects_section(notion: Client, cfg: dict, project_id: str) -> list[dict]:
-    blocks: list[dict] = [h2("Subprojects")]
-    rows = query_all(
-        notion, cfg["subprojects_data_source_id"],
-        filter={"property": "Parent Project", "relation": {"contains": project_id}},
-        sorts=[{"property": "Name", "direction": "ascending"}],
-    )
-    # Sort Active first, then by name (Notion doesn't let us sort by status
-    # in a custom order, so we do it client-side).
-    status_rank = {"Active": 0, "Paused": 1, "Done": 2, "Shelved": 3}
-    rows.sort(key=lambda r: (status_rank.get(select_name(r, "Status"), 9), title_of(r).lower()))
-    if not rows:
-        blocks.append(italic_para("No subprojects yet."))
-    else:
-        for r in rows:
-            status = select_name(r, "Status") or "—"
-            blocks.append(bullet(f"{title_of(r)}  ·  {status}"))
-    blocks.append(db_link_para("Open Subprojects DB →", cfg["subprojects_database_id"]))
-    return blocks
-
-
-def build_tasks_section(notion: Client, cfg: dict, subproject_ids_by_name: list[tuple[str, str]]) -> list[dict]:
-    """Tasks (Up Next): Status=Todo, scoped to this Project's subprojects.
-
-    Notion filter API cannot filter by rollup=Project directly in a useful
-    way, so we filter by the set of Subproject IDs under this project (OR of
-    contains). Sort by Subproject name asc (client-side) then Order asc.
-    """
-    blocks: list[dict] = [h2("Tasks")]
-    if not subproject_ids_by_name:
-        blocks.append(italic_para("No subprojects yet — add one to start a task list."))
-        blocks.append(db_link_para("Open Task List DB →", cfg["ptl_database_id"]))
-        return blocks
-
-    sub_id_to_name = {sid: sname for sname, sid in subproject_ids_by_name}
-    or_filter = [
-        {"property": "Subproject", "relation": {"contains": sid}}
-        for _, sid in subproject_ids_by_name
+def build_scaffold_section(heading: str, db_label: str, database_id: str) -> list[dict]:
+    return [
+        h2(heading),
+        italic_para(PLACEHOLDER),
+        db_link_para(db_label, database_id),
     ]
-    filt = {
-        "and": [
-            {"property": "Status", "select": {"equals": "Todo"}},
-            {"or": or_filter} if len(or_filter) > 1 else or_filter[0],
-        ]
-    }
-    rows = query_all(
-        notion, cfg["ptl_data_source_id"],
-        filter=filt,
-        sorts=[{"property": "Order", "direction": "ascending"}],
-    )
-
-    def _sort_key(row: dict) -> tuple:
-        sub_ids = relation_ids(row, "Subproject")
-        sub_name = sub_id_to_name.get(sub_ids[0], "") if sub_ids else ""
-        ord_n = number_of(row, "Order")
-        return (sub_name.lower(), ord_n if ord_n is not None else 1e9)
-
-    rows.sort(key=_sort_key)
-    rows = rows[:MAX_TASKS_DISPLAYED]
-
-    if not rows:
-        blocks.append(italic_para("No open tasks. Add one in the Task List DB to predetermine your next session."))
-    else:
-        current_sub = None
-        for r in rows:
-            sub_ids = relation_ids(r, "Subproject")
-            sub_name = sub_id_to_name.get(sub_ids[0], "") if sub_ids else "(no subproject)"
-            if sub_name != current_sub:
-                blocks.append(para(sub_name))
-                current_sub = sub_name
-            title = title_of(r, "Title")
-            ord_n = number_of(r, "Order")
-            prefix = f"[{int(ord_n)}] " if ord_n is not None else ""
-            blocks.append(bullet(f"{prefix}{title}"))
-    blocks.append(db_link_para("Open Task List DB →", cfg["ptl_database_id"]))
-    return blocks
 
 
-def build_recent_snapshots_section(notion: Client, cfg: dict, subproject_ids: list[str]) -> list[dict]:
-    blocks: list[dict] = [h2("Recent Snapshots")]
-    if not subproject_ids:
-        blocks.append(italic_para("No snapshots yet."))
-        blocks.append(db_link_para("Open Project Snapshots DB →", cfg["database_id"]))
-        return blocks
-
-    or_filter = [
-        {"property": "Subproject", "relation": {"contains": sid}}
-        for sid in subproject_ids
+def build_done_tasks_toggle(cfg: dict) -> list[dict]:
+    children = [
+        italic_para(PLACEHOLDER),
+        db_link_para("Open Task List DB →", cfg["ptl_database_id"]),
     ]
-    filt = {"or": or_filter} if len(or_filter) > 1 else or_filter[0]
-    rows = query_all(
-        notion, cfg["data_source_id"],
-        filter=filt,
-        sorts=[{"property": "Timestamp", "direction": "descending"}],
-        page_size=MAX_RECENT_SNAPSHOTS,
-    )
-    rows = rows[:MAX_RECENT_SNAPSHOTS]
-
-    if not rows:
-        blocks.append(italic_para("No snapshots yet."))
-    else:
-        for r in rows:
-            ts = ""
-            ts_prop = r.get("properties", {}).get("Timestamp", {}).get("date") or {}
-            if ts_prop:
-                ts = ts_prop.get("start", "")[:10]
-            # PS row has a title property — use title_of with fallback
-            label = title_of(r) or "(untitled snapshot)"
-            status_txt = ""
-            stp = r.get("properties", {}).get("Status", {}).get("rich_text") or []
-            if stp:
-                status_txt = "".join(t.get("plain_text", "") for t in stp)
-            line = f"{ts}  ·  {label}"
-            if status_txt:
-                line += f"  —  {status_txt[:120]}"
-            blocks.append(bullet(line))
-    blocks.append(db_link_para("Open Project Snapshots DB →", cfg["database_id"]))
-    return blocks
-
-
-def build_done_tasks_toggle(notion: Client, cfg: dict, subproject_ids_by_name: list[tuple[str, str]]) -> list[dict]:
-    if not subproject_ids_by_name:
-        return [toggle("Done tasks", [italic_para("No done tasks.")])]
-
-    sub_id_to_name = {sid: sname for sname, sid in subproject_ids_by_name}
-    or_filter = [
-        {"property": "Subproject", "relation": {"contains": sid}}
-        for _, sid in subproject_ids_by_name
-    ]
-    filt = {
-        "and": [
-            {"property": "Status", "select": {"equals": "Done"}},
-            {"or": or_filter} if len(or_filter) > 1 else or_filter[0],
-        ]
-    }
-    rows = query_all(
-        notion, cfg["ptl_data_source_id"],
-        filter=filt,
-        sorts=[{"property": "Completed At", "direction": "descending"}],
-    )
-    rows = rows[:MAX_DONE_TASKS_DISPLAYED]
-
-    children: list[dict] = []
-    if not rows:
-        children.append(italic_para("No done tasks yet."))
-    else:
-        for r in rows:
-            sub_ids = relation_ids(r, "Subproject")
-            sub_name = sub_id_to_name.get(sub_ids[0], "") if sub_ids else ""
-            title = title_of(r, "Title")
-            ca = r.get("properties", {}).get("Completed At", {}).get("date") or {}
-            ca_s = (ca.get("start") or "")[:10] if ca else ""
-            line = f"{ca_s}  ·  {sub_name}  ·  {title}" if sub_name else f"{ca_s}  ·  {title}"
-            children.append(bullet(line))
     return [toggle("Done tasks", children)]
 
 
 # ── Page-level operations ────────────────────────────────────────────────────
 
 def _has_real_content(notion: Client, page_id: str) -> bool:
-    """True if page has >0 child blocks that aren't a single empty paragraph."""
     resp = notion.blocks.children.list(block_id=page_id, page_size=5)
     children = resp.get("results", [])
     if not children:
@@ -333,23 +157,13 @@ def populate_project_page(notion: Client, cfg: dict, project_page_id: str, *, fo
         if n:
             print(f"    [force] archived {n} existing blocks")
 
-    # Gather subprojects for this project.
-    subs = query_all(
-        notion, cfg["subprojects_data_source_id"],
-        filter={"property": "Parent Project", "relation": {"contains": project_page_id}},
-    )
-    subproject_ids_by_name = [(title_of(s), s["id"]) for s in subs]
-    subproject_ids_by_name.sort(key=lambda t: t[0].lower())
-    subproject_ids = [sid for _, sid in subproject_ids_by_name]
-
     blocks: list[dict] = []
     blocks += build_notes_section()
-    blocks += build_subprojects_section(notion, cfg, project_page_id)
-    blocks += build_tasks_section(notion, cfg, subproject_ids_by_name)
-    blocks += build_recent_snapshots_section(notion, cfg, subproject_ids)
-    blocks += build_done_tasks_toggle(notion, cfg, subproject_ids_by_name)
+    blocks += build_scaffold_section("Subprojects", "Open Subprojects DB →", cfg["subprojects_database_id"])
+    blocks += build_scaffold_section("Tasks", "Open Task List DB →", cfg["ptl_database_id"])
+    blocks += build_scaffold_section("Recent Snapshots", "Open Project Snapshots DB →", cfg["database_id"])
+    blocks += build_done_tasks_toggle(cfg)
 
-    # Notion caps children per request at 100. Chunk just in case.
     for i in range(0, len(blocks), 95):
         chunk = blocks[i:i + 95]
         notion.blocks.children.append(block_id=project_page_id, children=chunk)
@@ -382,9 +196,8 @@ def populate_all_empty(notion: Client, cfg: dict, *, force: bool = False) -> int
 def main() -> None:
     force = "--force" in sys.argv
     cfg = load_config()
-    for k in ("notion_token", "projects_data_source_id", "subprojects_data_source_id",
-              "ptl_data_source_id", "data_source_id", "projects_database_id",
-              "subprojects_database_id", "ptl_database_id", "database_id"):
+    for k in ("notion_token", "projects_data_source_id", "subprojects_database_id",
+              "ptl_database_id", "database_id"):
         if not cfg.get(k):
             print(f"ERROR: config missing '{k}'. Run setup_notion.py / migrate_to_ptl.py first.")
             sys.exit(1)
