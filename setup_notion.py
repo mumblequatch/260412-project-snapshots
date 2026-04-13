@@ -327,6 +327,15 @@ def main() -> None:
         cfg["ptl_data_source_id"] = ds_id
         save_config(cfg)
 
+    # 6. Populate empty Project page bodies (no-op if no Projects rows yet).
+    try:
+        from new_project_page import populate_all_empty
+        print("\nPopulating empty Project page bodies…")
+        n = populate_all_empty(notion, cfg, force=False)
+        print(f"  populated {n} project page(s).")
+    except Exception as e:
+        print(f"  (skipped project page population: {e})")
+
     print("\nDone. Config saved to", CONFIG_PATH)
     print("\nNext: run migrate_to_ptl.py to backfill Projects/Subprojects from existing Snapshots.")
 
