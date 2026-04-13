@@ -89,7 +89,8 @@ def fetch_latest_snapshot(notion: Client, data_source_id: str, project: str) -> 
     results = resp.get("results", [])
     if not results:
         return None
-    props = results[0]["properties"]
+    page = results[0]
+    props = page["properties"]
     ts = (props.get("Timestamp") or {}).get("date") or {}
     return {
         "status": rt_to_plain(props.get("Status")),
@@ -97,6 +98,7 @@ def fetch_latest_snapshot(notion: Client, data_source_id: str, project: str) -> 
         "open_questions": rt_to_plain(props.get("Open Questions")),
         "latest_files": rt_to_plain(props.get("Latest Files")),
         "timestamp": ts.get("start", ""),
+        "page_url": page.get("url", ""),
     }
 
 
@@ -111,11 +113,14 @@ def create_snapshot(
     latest_files: str,
     session_notes: str,
 ) -> None:
-    now_iso = datetime.now().astimezone().isoformat()
+    now = datetime.now().astimezone()
+    now_iso = now.isoformat()
+    title = f"{project} · {now.strftime('%Y-%m-%d %H:%M')}"
     file_lines = [l for l in latest_files.splitlines() if l.strip()]
     notion.pages.create(
         parent={"type": "data_source_id", "data_source_id": data_source_id},
         properties={
+            "Name": {"title": rt(title)},
             "Project": {"select": {"name": project}},
             "Status": {"rich_text": rt(status)},
             "Next Action": {"rich_text": rt(next_action)},
@@ -162,10 +167,13 @@ def refresh_overview(notion: Client, cfg: dict) -> None:
         }
     ]
 
-    def cell(text: str, *, bold: bool = False) -> list:
+    def cell(text: str, *, bold: bool = False, url: str = "") -> list:
         if not text:
             return []
-        rt_obj = {"type": "text", "text": {"content": text[:2000]}}
+        text_obj = {"content": text[:2000]}
+        if url:
+            text_obj["link"] = {"url": url}
+        rt_obj = {"type": "text", "text": text_obj}
         if bold:
             rt_obj["annotations"] = {"bold": True}
         return [rt_obj]
@@ -190,12 +198,14 @@ def refresh_overview(notion: Client, cfg: dict) -> None:
             next_action = "—"
             first_file = ""
             updated = "—"
+            page_url = ""
         else:
             status = latest["status"] or "—"
             next_action = latest["next_action"] or "—"
             files = [f for f in latest["latest_files"].splitlines() if f.strip()]
             first_file = files[0] if files else "—"
             updated = _fmt_updated(latest["timestamp"])
+            page_url = latest["page_url"]
         table_rows.append({
             "type": "table_row",
             "table_row": {
@@ -204,7 +214,7 @@ def refresh_overview(notion: Client, cfg: dict) -> None:
                     cell(status),
                     cell(next_action),
                     cell(first_file),
-                    cell(updated),
+                    cell(updated, url=page_url),
                 ]
             },
         })
